@@ -1,0 +1,7 @@
+<h1>omniauth-atproto</h1>
+<p>Enter your handle to sign in with AT Proto.</p>
+
+<%= form_with url: "/auth/atproto", data: { turbo: false } do |form| %>
+  <%= form.text_field :handle, value: "marckohlbrugge.com" %>
+  <%= form.submit "Sign in with AT Proto" %>
+<% end %>
