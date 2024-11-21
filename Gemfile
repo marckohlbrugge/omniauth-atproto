@@ -38,3 +38,7 @@ gem "omniauth", "~> 2.1"
 gem "omniauth-oauth2", "~> 1.8"
 gem "omniauth-rails_csrf_protection"
 gem "faraday", "~> 2.12"
+gem "jwt"
+gem "json-jwt", "~> 1.16"
+
+gem "http", "~> 5.2"

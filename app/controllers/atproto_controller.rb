@@ -1,11 +1,21 @@
 class AtprotoController < ApplicationController
   def client_metadata
-    render json: {
+    key_pair = get_oauth_key_pair
+    return head :not_found if key_pair.nil?
+
+    Rails.logger.debug "Creating client metadata with key_pair:"
+    Rails.logger.debug "  Public key class: #{key_pair[:public_key].class}"
+    Rails.logger.debug "  Key pair ID: #{key_pair[:id]}"
+
+    public_key_jwk = create_ecdsa_public_key_jwk_with_id(key_pair[:public_key], key_pair[:id])
+    Rails.logger.debug "Generated public key JWK: #{public_key_jwk.inspect}"
+
+    response = {
       client_id: production_oauth_client_id,
       application_type: "web",
       grant_types: [ "authorization_code", "refresh_token" ],
       scope: [ "atproto", "transition:generic" ].join(" "),
-      response_type: [ "code" ], # TODO: might need to be plural
+      response_type: [ "code" ],
       redirect_uris: [ production_oauth_redirect_uri ],
       token_endpoint_auth_method: "private_key_jwt",
       token_endpoint_auth_signing_alg: "ES256",
@@ -14,62 +24,52 @@ class AtprotoController < ApplicationController
         keys: [ public_key_jwk ]
       }
     }
+
+    Rails.logger.debug "Full client metadata response: #{response.inspect}"
+
+    render json: response
   end
 
   private
 
-  def production_oauth_client_id
-    "https://local.blueskycounter.com/auth/atproto/client-metadata.json"
-  end
-
-  def production_oauth_redirect_uri
-    "https://local.blueskycounter.com/auth/atproto/callback"
-  end
-
-  def public_key_jwk
-    create_ecdsa_public_key_jwk_with_id(key_pair[:public_key], key_pair[:id])
-  end
-
-  def create_ecdsa_public_key_jwk_with_id(public_key, id)
-    # Extract coordinates from EC public key
-    point = public_key.public_key.to_bn
-    group = public_key.group
-    point = OpenSSL::PKey::EC::Point.new(group, point)
-
-    # Get x,y coordinates in binary
-    encoded_point = point.to_octet_string(:uncompressed)
-    x_bin = encoded_point[1..32]
-    y_bin = encoded_point[33..64]
-
-    # Base64URL encode coordinates
-    x = Base64.urlsafe_encode64(x_bin, padding: false)
-    y = Base64.urlsafe_encode64(y_bin, padding: false)
-
-    jwk = {
-      kid: id,
-      kty: "EC",
-      crv: "P-256",
-      x: x,
-      y: y,
-      use: "sig"
-    }
-    jwk
-  end
-
-  def key_pair
+  def get_oauth_key_pair
     private_key_base64 = Rails.application.credentials.dig(:atproto, :private_key)
     public_key_base64 = Rails.application.credentials.dig(:atproto, :public_key)
     key_pair_id = Rails.application.credentials.dig(:atproto, :key_pair_id)
 
-    raise "Missing ATProto credentials." if private_key_base64.blank? || public_key_base64.blank? || key_pair_id.blank?
-
-    private_key = OpenSSL::PKey::EC.new(Base64.decode64(private_key_base64))
-    public_key = OpenSSL::PKey::EC.new(Base64.decode64(public_key_base64))
+    return nil if private_key_base64.nil? || public_key_base64.nil? || key_pair_id.nil?
 
     {
-      private_key: private_key,
-      public_key: public_key,
+      public_key: Base64.decode64(public_key_base64),
+      private_key: Base64.decode64(private_key_base64),
       id: key_pair_id
     }
+  end
+
+  def create_ecdsa_public_key_jwk_with_id(public_key, id)
+    key = OpenSSL::PKey::EC.new(public_key)
+    jwk = JWT::JWK.new(key)
+
+    # Merge the base JWK with our additional parameters
+    jwk.export.merge({
+      kid: id,
+      use: "sig"
+    })
+  end
+
+  def production_oauth_client_id
+    raise "Public URL not defined" if public_url.nil?
+
+    URI.join(public_url, "/auth/atproto/client-metadata.json").to_s
+  end
+
+  def production_oauth_redirect_uri
+    raise "Public URL not defined" if public_url.nil?
+
+    URI.join(public_url, "/auth/atproto/callback").to_s
+  end
+
+  def public_url
+    "https://local.blueskycounter.com"
   end
 end

@@ -1,11 +1,17 @@
 require "omniauth-oauth2"
 require "faraday"
 require "jwt"
+require "ostruct"
+
+require "atproto_oauth_client"
 
 module OmniAuth
   module Strategies
     class Atproto < OmniAuth::Strategies::OAuth2
       option :name, "atproto"
+
+      # Enable PKCE
+      option :pkce, true
 
       option :client_options, {
         site: nil,
@@ -13,96 +19,172 @@ module OmniAuth
         token_url: nil
       }
 
+      def state
+        @state ||= SecureRandom.hex(24)
+      end
+
       def request_phase
-        # Check if handle parameter is present
+        Rails.logger.debug "Starting request phase"
+        Rails.logger.debug "Request params: #{request.params.inspect}"
+
+        # Get and validate handle
         unless request.params["handle"]
+          Rails.logger.error "Missing required handle parameter"
           fail!(:missing_handle, OmniAuth::Error.new("Handle parameter is required"))
           return
         end
-
         handle = request.params["handle"]
-        did = resolve_handle(handle)
-        pds_endpoint = get_pds_from_did(did)
-        auth_server = get_authorization_server(pds_endpoint)
-        auth_metadata = get_auth_server_metadata(auth_server)
+        Rails.logger.debug "Using handle: #{handle}"
 
-        # Update client options with discovered endpoints
-        options.client_options.site = auth_metadata[:issuer]
-        options.client_options.authorize_url = auth_metadata[:authorization_endpoint]
-        options.client_options.token_url = auth_metadata[:token_endpoint]
+        begin
+          # Follow the exact same flow as TypeScript
+          Rails.logger.debug "Resolving handle to DID..."
+          did = resolve_atproto_handle(handle)
+          raise "Failed to get valid DID" if did.nil? || did.empty?
+          Rails.logger.debug "Resolved DID: #{did}"
 
-        # Set up PKCE
-        code_verifier = SecureRandom.urlsafe_base64(64)
-        code_challenge = generate_code_challenge(code_verifier)
+          Rails.logger.debug "Getting PDS endpoint from DID..."
+          pds_endpoint = get_pds_from_account_did(did)
+          raise "Failed to get valid PDS endpoint" if pds_endpoint.nil? || pds_endpoint.empty?
+          Rails.logger.debug "Found PDS endpoint: #{pds_endpoint}"
 
-        session["omniauth.code_verifier"] = code_verifier
-        session["omniauth.did"] = did
+          Rails.logger.debug "Getting authorization server from PDS..."
+          auth_server = get_authorization_server(pds_endpoint)
+          raise "Failed to get valid auth server" if auth_server.nil? || auth_server.empty?
+          Rails.logger.debug "Found auth server: #{auth_server}"
 
-        # Create client_id with redirect_uri and scope
-        client_id = "https://local.blueskycounter.com/auth/atproto/client-metadata.json"
+          Rails.logger.debug "Getting authorization server metadata..."
+          auth_metadata = get_atproto_authorization_server_metadata(auth_server)
+          raise "Missing required metadata fields" unless auth_metadata[:issuer] &&
+                                                       auth_metadata[:token_endpoint] &&
+                                                       auth_metadata[:authorization_endpoint]
+          Rails.logger.debug "Auth metadata: #{auth_metadata}"
 
-        options.client_id = client_id
-        Rails.logger.debug "Request phase client_id: #{client_id}"
+          # Generate PKCE values before storing in session
+          Rails.logger.debug "Generating PKCE values..."
+          code_verifier = SecureRandom.urlsafe_base64(64).tr("lIO0", "sxyz")
+          Rails.logger.debug "Generated code verifier: #{code_verifier}"
 
-        # Add PKCE parameters to the authorization request
-        options.authorize_params.code_challenge = code_challenge
-        options.authorize_params.code_challenge_method = "S256"
+          Rails.logger.debug "Generating code challenge from verifier"
+          code_challenge = Base64.urlsafe_encode64(
+            OpenSSL::Digest::SHA256.digest(code_verifier),
+            padding: false
+          )
+          Rails.logger.debug "Generated code challenge: #{code_challenge}"
 
-        options.authorize_params.scope = "atproto transition:generic"
+          # Store values in session
+          Rails.logger.debug "Storing values in session..."
+          session["omniauth.state"] = state
+          session["omniauth.issuer"] = auth_metadata[:issuer]
+          session["omniauth.did"] = did
+          session["omniauth.pkce.code_verifier"] = code_verifier
+          session["omniauth.client_id"] = options.client_id || options.client_options[:client_id]
+          Rails.logger.debug "Stored client_id in session: #{session['omniauth.client_id']}"
 
-        super
+          # Ensure PKCE code verifier is stored in session
+          Rails.logger.debug "Generating PKCE values..."
+          code_verifier = SecureRandom.urlsafe_base64(64)
+          raise "Failed to generate code verifier" if code_verifier.nil? || code_verifier.length < 43
+          session["omniauth.pkce.code_verifier"] = code_verifier
+
+          code_challenge = generate_code_challenge(code_verifier)
+          raise "Failed to generate code challenge" if code_challenge.nil? || code_challenge.empty?
+          Rails.logger.debug "PKCE code_challenge: #{code_challenge}"
+
+          # Update client options with discovered endpoints
+          Rails.logger.debug "Updating client options..."
+          options.client_options.site = auth_metadata[:issuer]
+          options.client_options.authorize_url = auth_metadata[:authorization_endpoint]
+          options.client_options.token_url = auth_metadata[:token_endpoint]
+
+          # Set client ID based on environment
+          public_url = "https://local.blueskycounter.com"
+          client_id = URI.join(public_url, "/auth/atproto/client-metadata.json").to_s
+          raise "Failed to construct client_id" if client_id.nil? || client_id.empty?
+          options.client_id = client_id
+          Rails.logger.debug "Using client_id: #{client_id}"
+
+          # Set up authorization params
+          Rails.logger.debug "Setting up authorization params..."
+          options.authorize_params = {
+            client_id: client_id,
+            state: state,
+            handle: handle,
+            scope: "atproto transition:generic"
+          }
+          Rails.logger.debug "Authorization params: #{options.authorize_params}"
+
+          Rails.logger.debug "Proceeding with OAuth2 flow..."
+          super
+        rescue StandardError => e
+          Rails.logger.error "Error in request phase: #{e.class} - #{e.message}"
+          Rails.logger.error e.backtrace.join("\n")
+          fail!(:invalid_request, e)
+        end
       end
 
       def callback_phase
-        if request.params["error"]
-          fail!(request.params["error"], CallbackError.new(request.params["error"], request.params["error_description"]))
-        elsif !request.params["code"]
-          fail!(:missing_code, OmniAuth::Error.new("No code parameter in callback request"))
-        else
-          begin
-            # Get stored values from session
-            code_verifier = session.delete("omniauth.code_verifier")
-            did = session.delete("omniauth.did")
+        Rails.logger.debug "Starting callback phase"
+        Rails.logger.debug "Request params: #{request.params.inspect}"
 
-            # Get token endpoint from auth server metadata, just like TypeScript
-            pds_endpoint = get_pds_from_did(did)
-            auth_server = get_authorization_server(pds_endpoint)
-            auth_metadata = get_auth_server_metadata(auth_server)
-            options.client_options.token_url = auth_metadata[:token_endpoint]
+        begin
+          stored_state = session.delete("omniauth.state")
+          stored_issuer = session.delete("omniauth.issuer")
+          stored_did = session.delete("omniauth.did")
+          stored_client_id = session.delete("omniauth.client_id")
+          stored_code_verifier = session.delete("omniauth.pkce.code_verifier")
 
-            # Generate DPoP key pair
-            dpop_key_pair = generate_dpop_key_pair
+          Rails.logger.debug "Retrieved session values:"
+          Rails.logger.debug "  state: #{stored_state}"
+          Rails.logger.debug "  issuer: #{stored_issuer}"
+          Rails.logger.debug "  did: #{stored_did}"
+          Rails.logger.debug "  client_id: #{stored_client_id}"
+          Rails.logger.debug "  code_verifier: #{stored_code_verifier}"
 
-            # Exchange code for tokens
-            tokens = exchange_code_for_tokens(
-              request.params["code"],
-              code_verifier,
-              dpop_key_pair
-            )
+          # Get the private key from credentials
+          private_key_base64 = Rails.application.credentials.atproto[:private_key]
+          Rails.logger.debug "Retrieved private key from credentials (first 10 chars): #{private_key_base64[0..10]}..."
 
-            # Verify DID matches
-            if tokens[:did] != did
-              fail!(:did_mismatch, CallbackError.new(:did_mismatch, "DID mismatch"))
-              return
-            end
-
-            # Fetch user profile
-            profile = fetch_user_profile(tokens[:access_token], tokens[:did], dpop_key_pair)
-
-            # Build auth hash
-            @auth_hash = build_auth_hash(tokens, profile, dpop_key_pair)
-
-            super
-          rescue StandardError => e
-            fail!(:invalid_credentials, e)
+          # Verify the state parameter
+          unless stored_state.to_s.length > 0 && stored_state == request.params["state"]
+            Rails.logger.error "State mismatch! Expected #{stored_state}, got #{request.params['state']}"
+            return fail!(:csrf_detected, CallbackError.new(:csrf_detected, "CSRF detected"))
           end
+
+          client = ATProtoOAuthClient.new(
+            stored_issuer,
+            stored_client_id,
+            callback_url,
+            private_key_base64
+          )
+
+          access_token = client.validate_authorization_code(
+            request.params["code"],
+            stored_code_verifier,
+            request.params["iss"],
+            request.params["state"]
+          )
+
+          # ... rest of the callback phase ...
+        rescue StandardError => e
+          Rails.logger.error "Error in callback phase: #{e.class} - #{e.message}"
+          Rails.logger.error e.backtrace.join("\n")
+          fail!(:invalid_credentials, e)
         end
+      end
+
+      # Override to return our custom auth hash
+      def auth_hash
+        @auth_hash
       end
 
       private
 
-      def resolve_handle(handle)
+      def resolve_atproto_handle(handle)
+        Rails.logger.debug "Resolving handle: #{handle}"
+
         # Try DNS TXT record first
+        Rails.logger.debug "Attempting DNS TXT record lookup..."
         txt_response = Faraday.get(
           "https://cloudflare-dns.com/dns-query",
           { name: "_atproto.#{handle}", type: "TXT" },
@@ -110,44 +192,68 @@ module OmniAuth
         )
 
         if txt_response.success?
+          Rails.logger.debug "DNS TXT response: #{txt_response.body}"
           result = JSON.parse(txt_response.body)
           if answer = result["Answer"]&.first
             record = answer["data"]
+            Rails.logger.debug "Found DNS TXT record: #{record}"
             return parse_txt_dns_record(record)
           end
         end
 
         # Fallback to well-known endpoint
+        Rails.logger.debug "Falling back to well-known endpoint..."
         wellknown_response = Faraday.get("https://#{handle}/.well-known/atproto-did")
-        return wellknown_response.body if wellknown_response.success?
+        if wellknown_response.success?
+          Rails.logger.debug "Well-known response: #{wellknown_response.body}"
+          return wellknown_response.body
+        end
 
-        raise "Failed to resolve handle"
+        raise "Failed to resolve handle through both DNS and well-known methods"
       end
 
-      def get_pds_from_did(did)
+      def get_pds_from_account_did(did)
+        Rails.logger.debug "Getting PDS from DID: #{did}"
+        raise "Empty or invalid DID" if did.nil? || did.empty?
+
         if did.start_with?("did:plc:")
+          Rails.logger.debug "Using PLC directory resolution"
           get_pds_from_plc_did(did)
         elsif did.start_with?("did:web:")
+          Rails.logger.debug "Using Web DID resolution"
           get_pds_from_web_did(did)
         else
-          raise "Unknown DID format"
+          raise "Unknown DID format: #{did}"
         end
       end
 
       def get_authorization_server(pds_endpoint)
+        Rails.logger.debug "Getting authorization server from PDS: #{pds_endpoint}"
+        raise "Invalid PDS endpoint" if pds_endpoint.nil? || pds_endpoint.empty?
+
         response = Faraday.get("#{pds_endpoint}/.well-known/oauth-protected-resource")
-        raise "Failed to get PDS authorization server" unless response.success?
+        raise "Failed to get PDS authorization server: #{response.status}" unless response.success?
 
         result = JSON.parse(response.body)
-        result.dig("authorization_servers", 0) or raise "No authorization server found"
+        Rails.logger.debug "Authorization server response: #{result}"
+
+        auth_server = result.dig("authorization_servers", 0)
+        raise "No authorization server found in response" unless auth_server
+
+        auth_server
       end
 
-      def get_auth_server_metadata(issuer)
+      def get_atproto_authorization_server_metadata(issuer)
+        Rails.logger.debug "Getting authorization server metadata from: #{issuer}"
+        raise "Invalid issuer" if issuer.nil? || issuer.empty?
+
         response = Faraday.get("#{issuer}/.well-known/oauth-authorization-server")
-        raise "Failed to get authorization server metadata" unless response.success?
+        raise "Failed to get authorization server metadata: #{response.status}" unless response.success?
 
         result = JSON.parse(response.body)
-        raise "Invalid metadata" unless result["issuer"] == issuer
+        Rails.logger.debug "Authorization server metadata: #{result}"
+
+        raise "Invalid metadata - issuer mismatch" unless result["issuer"] == issuer
 
         {
           issuer:,
@@ -157,254 +263,74 @@ module OmniAuth
         }
       end
 
-      def generate_code_challenge(verifier)
-        Base64.urlsafe_encode64(
-          Digest::SHA256.digest(verifier),
-          padding: false
-        )
-      end
-
       def parse_txt_dns_record(record)
+        Rails.logger.debug "Parsing TXT record: #{record}"
         return unless record.start_with?('"') && record.end_with?('"')
 
         key_value = record[1..-2] # Remove surrounding quotes
         key, value = key_value.split("=")
 
-        raise "Invalid record format" unless key == "did"
+        raise "Invalid record format - expected 'did=' prefix" unless key == "did"
+        raise "Empty DID value in record" if value.nil? || value.empty?
+
+        Rails.logger.debug "Parsed DID from TXT record: #{value}"
         value
       end
 
       def get_pds_from_plc_did(did)
+        Rails.logger.debug "Getting PDS from PLC DID: #{did}"
         response = Faraday.get("https://plc.directory/#{did}")
-        raise "Invalid DID" unless response.success?
+        raise "Invalid DID response: #{response.status}" unless response.success?
 
         result = JSON.parse(response.body)
+        Rails.logger.debug "PLC directory response: #{result}"
+
         find_pds_service_endpoint(result["service"])
       end
 
       def get_pds_from_web_did(did)
+        Rails.logger.debug "Getting PDS from Web DID: #{did}"
         prefix = "did:web:"
-        raise "Invalid Web DID" unless did.start_with?(prefix)
+        raise "Invalid Web DID format" unless did.start_with?(prefix)
 
         target = did[prefix.length..]
         target = target.gsub(":", "/")
         target = URI.decode_www_form_component(target)
+        Rails.logger.debug "Decoded Web DID target: #{target}"
 
         response = Faraday.get("https://#{target}/.well-known/did.json")
-        raise "Invalid DID" unless response.success?
+        raise "Invalid DID response: #{response.status}" unless response.success?
 
         result = JSON.parse(response.body)
+        Rails.logger.debug "Web DID document: #{result}"
+
         find_pds_service_endpoint(result["service"])
       end
 
       def find_pds_service_endpoint(services)
+        Rails.logger.debug "Finding PDS service endpoint in services: #{services}"
+        raise "No services found" if services.nil? || !services.is_a?(Array)
+
         service = Array(services).find { |s| s["id"] == "#atproto_pds" }
-        service&.fetch("serviceEndpoint") or raise "Failed to get PDS"
+        raise "PDS service not found" unless service
+
+        endpoint = service["serviceEndpoint"]
+        raise "Missing serviceEndpoint in PDS service" unless endpoint
+
+        Rails.logger.debug "Found PDS endpoint: #{endpoint}"
+        endpoint
       end
 
-      def exchange_code_for_tokens(code, code_verifier, dpop_key_pair)
-        private_key_base64 = Rails.application.credentials.dig(:atproto, :private_key)
-        key_pair_id = Rails.application.credentials.dig(:atproto, :key_pair_id)
-        private_key = OpenSSL::PKey::EC.new(Base64.decode64(private_key_base64))
+      def generate_code_challenge(verifier)
+        Rails.logger.debug "Generating code challenge from verifier"
+        raise "Invalid verifier" if verifier.nil? || verifier.empty?
 
-        client_id = "https://local.blueskycounter.com/auth/atproto/client-metadata.json"
-
-        client_assertion = create_client_assertion(
-          client_id,
-          options.client_options.site,
-          private_key,
-          key_pair_id
+        challenge = Base64.urlsafe_encode64(
+          OpenSSL::Digest::SHA256.digest(verifier),
+          padding: false
         )
-
-        body = {
-          grant_type: "authorization_code",
-          client_id: client_id,
-          code: code,
-          code_verifier: code_verifier,
-          redirect_uri: callback_url,
-          client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-          client_assertion: client_assertion
-        }
-
-        response = client.auth_code.get_token(
-          code,
-          body.merge(
-            headers: {
-              "Content-Type" => "application/x-www-form-urlencoded",
-              "Accept" => "application/json",
-              "DPoP" => generate_dpop_token(dpop_key_pair, "POST", options.client_options.token_url)
-            }
-          )
-        )
-
-        {
-          access_token: response.token,
-          refresh_token: response.refresh_token,
-          expires_at: response.expires_at,
-          did: response.params["sub"]
-        }
-      end
-
-      def fetch_user_profile(access_token, did, dpop_key_pair)
-        pds_endpoint = get_pds_from_did(did)
-        url = "#{pds_endpoint}/xrpc/app.bsky.actor.getProfile?actor=#{did}"
-
-        request = Faraday::Request.new do |req|
-          req.url url
-          req.headers["Authorization"] = "DPoP #{access_token}"
-          req.headers["DPoP"] = generate_dpop_token(dpop_key_pair, "GET", url)
-        end
-
-        response, _nonce = handle_oauth_request(request, dpop_key_pair)
-
-        raise "Failed to fetch profile" unless response.success?
-        JSON.parse(response.body)
-      end
-
-      def build_auth_hash(tokens, profile, dpop_key_pair)
-        OmniAuth::Utils.deep_merge(super(), {
-          "uid" => tokens[:did],
-          "credentials" => {
-            "token" => tokens[:access_token],
-            "refresh_token" => tokens[:refresh_token],
-            "expires_at" => tokens[:expires_at],
-            "expires" => true
-          },
-          "info" => {
-            "did" => tokens[:did],
-            "handle" => profile["handle"],
-            "display_name" => profile["displayName"],
-            "description" => profile["description"],
-            "avatar" => profile.dig("avatar", "url"),
-            "dpop_key" => export_dpop_key(dpop_key_pair)
-          },
-          "extra" => {
-            "raw_info" => profile
-          }
-        })
-      end
-
-      def generate_dpop_key_pair
-        OpenSSL::PKey::EC.generate("prime256v1")
-      end
-
-      def generate_dpop_token(key_pair, method, url, nonce = nil)
-        # Generate random bytes for jti
-        jti_bytes = SecureRandom.random_bytes(20)
-        jti = Base64.urlsafe_encode64(jti_bytes, padding: false)
-
-        # Create header with public key JWK
-        header = {
-          typ: "dpop+jwt",
-          alg: "ES256",
-          jwk: create_public_key_jwk(key_pair)
-        }
-
-        # Create payload
-        payload = {
-          jti: jti,
-          htm: method,
-          htu: url.split("?")[0],
-          iat: Time.now.to_i
-        }
-        payload[:nonce] = nonce if nonce
-
-        # Convert to JSON and encode
-        header_json = header.to_json
-        payload_json = payload.to_json
-
-        encoded_header = Base64.urlsafe_encode64(header_json, padding: false)
-        encoded_payload = Base64.urlsafe_encode64(payload_json, padding: false)
-
-        # Create signature input (matches createJWTSignatureMessage)
-        message = "#{encoded_header}.#{encoded_payload}"
-
-        # Sign using SHA256 digest
-        digest = OpenSSL::Digest.new("sha256")
-        signature = key_pair.sign(digest, message)
-
-        # Encode signature
-        encoded_signature = Base64.urlsafe_encode64(signature, padding: false)
-
-        # Return complete JWT
-        "#{message}.#{encoded_signature}"
-      end
-
-      def export_dpop_key(key_pair)
-        {
-          private_key: key_pair.to_pem,
-          public_key: key_pair.public_key.to_pem
-        }.to_json
-      end
-
-      private
-
-      def create_public_key_jwk(key_pair)
-        pub_key_bn = key_pair.public_key.to_bn
-        pub_key_hex = pub_key_bn.to_s(16)
-
-        # Extract x and y coordinates (skip the 0x04 prefix)
-        x_hex = pub_key_hex[2, 64]
-        y_hex = pub_key_hex[66, 64]
-
-        {
-          kty: "EC",
-          crv: "P-256",
-          x: Base64.urlsafe_encode64([ x_hex ].pack("H*"), padding: false),
-          y: Base64.urlsafe_encode64([ y_hex ].pack("H*"), padding: false)
-        }
-      end
-
-      def refresh_access_token(refresh_token, dpop_key_pair, dpop_nonce = nil)
-        response = client.get_token(
-          grant_type: "refresh_token",
-          refresh_token:,
-          headers: {
-            "DPoP" => generate_dpop_token(dpop_key_pair, "POST", options.client_options.token_url, dpop_nonce)
-          }
-        )
-
-        {
-          access_token: response.token,
-          refresh_token: response.refresh_token,
-          expires_at: response.expires_at,
-          did: response.params["sub"]
-        }
-      end
-
-      def handle_oauth_request(request, dpop_key_pair, dpop_nonce = nil)
-        response = request.execute
-        new_nonce = response.headers["DPoP-Nonce"]
-
-        if response.status == 401 && response.headers["WWW-Authenticate"]&.start_with?("DPoP")
-          # Retry with new nonce if provided
-          if new_nonce
-            request.headers["DPoP"] = generate_dpop_token(dpop_key_pair, request.method, request.url, new_nonce)
-            response = request.execute
-          end
-        end
-
-        [ response, new_nonce ]
-      end
-
-      def create_client_assertion(client_id, auth_server_issuer, private_key, key_pair_id)
-        header = {
-          typ: "JWT",
-          alg: "ES256",
-          kid: key_pair_id
-        }
-
-        issued_at = Time.now.to_i
-        payload = {
-          iss: client_id,
-          sub: client_id,
-          aud: auth_server_issuer,
-          jti: SecureRandom.base64(20),
-          iat: issued_at,
-          exp: issued_at + 60
-        }
-
-        JWT.encode(payload, private_key, "ES256", header)
+        Rails.logger.debug "Generated code challenge: #{challenge}"
+        challenge
       end
     end
   end
